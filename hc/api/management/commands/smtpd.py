@@ -15,7 +15,7 @@ from django.core.management.base import BaseCommand
 from django.db import close_old_connections, connection
 from minismtpd import SMTPServer
 
-from hc.api.models import Check
+from hc.api.models import Check, lookup_check_by_slug
 from hc.lib.html import html2text
 from hc.lib.string import match_keywords
 
@@ -56,10 +56,10 @@ def _process_message(remote_addr: str, mailfrom: str, mailto: str, data: bytes) 
     to_parts = mailto.split("@")
     mbox = to_parts[0]
     if "+" in mbox:
-        # Pinging by slug
+        # Pinging by slug, or by an active slug alias after a batch rename.
         ping_key, slug = mbox.split("+")
         try:
-            check = Check.objects.get(slug=slug, project__ping_key=ping_key)
+            check = lookup_check_by_slug(ping_key, slug)
         except Check.DoesNotExist:
             return f"Check not found: {mailto}"
         except Check.MultipleObjectsReturned:

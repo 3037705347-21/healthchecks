@@ -38,7 +38,16 @@ from pydantic_core import PydanticCustomError
 from hc.accounts.models import Profile, Project
 from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
 from hc.api.forms import FlipsFiltersForm
-from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
+from hc.api.models import (
+    Channel,
+    Check,
+    Flip,
+    Notification,
+    Ping,
+    SlugAlias,
+    lookup_check_by_slug,
+    prepare_durations,
+)
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
@@ -257,7 +266,9 @@ def ping_by_slug(
 
     created = False
     try:
-        check = Check.objects.get(slug=slug, project__ping_key=ping_key)
+        # Resolves the primary slug, or an active (pending/migrated) slug
+        # alias left over from a batch rename to a new slug.
+        check = lookup_check_by_slug(ping_key, slug)
     except Check.DoesNotExist:
         if request.GET.get("create") != "1":
             return HttpResponseNotFound("not found")
@@ -272,6 +283,10 @@ def ping_by_slug(
         # exceed their check limit up to 2 times.
         if profile.num_checks_used() >= profile.check_limit * 2:
             return HttpResponseNotFound("not found")
+
+        # Drop a superseded, expired alias so the slug can be reused by the
+        # freshly provisioned check.
+        SlugAlias.objects.filter(project=project, slug=slug).delete()
 
         check = Check(project=project, name=slug, slug=slug)
         check.save()

@@ -1434,6 +1434,86 @@ class Flip(models.Model):
         return None
 
 
+SLUG_ALIAS_STATES = (
+    ("pending", "Pending"),
+    ("migrated", "Migrated"),
+    ("expired", "Expired"),
+)
+
+
+class SlugAlias(models.Model):
+    """A previous slug of a check, kept alive while deployments are renamed.
+
+    When a batch of checks gets renamed from an old slug to a new slug, old
+    deployment scripts may keep pinging the old address. A SlugAlias routes
+    pings sent to the old slug to the same check (and so the same ping
+    history) as the new slug. Aliases progress through three groups:
+
+    - pending: registered in a migration plan, the rebind is not applied yet
+    - migrated: the check now carries the new slug, the old slug routes here
+    - expired: retired, the old slug no longer resolves
+
+    """
+
+    project = models.ForeignKey(Project, models.CASCADE)
+    owner = models.ForeignKey(
+        Check, models.CASCADE, related_name="slug_aliases"
+    )
+    slug = models.CharField(max_length=100)
+    # The slug the owner check is rebound to when the alias becomes migrated
+    new_slug = models.CharField(max_length=100, blank=True, default="")
+    state = models.CharField(
+        max_length=8, choices=SLUG_ALIAS_STATES, default="pending"
+    )
+    created = models.DateTimeField(default=now)
+    rebinded = models.DateTimeField(null=True, blank=True)
+    expired_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = (
+            models.UniqueConstraint(
+                fields=["project", "slug"],
+                name="api_slugalias_project_slug",
+            ),
+        )
+        indexes = (
+            models.Index(
+                fields=["project", "state"],
+                name="api_slugalias_project_state",
+            ),
+        )
+
+    def __str__(self) -> str:
+        return f"{self.slug} -> check {self.owner_id} ({self.state})"
+
+
+def lookup_check_by_slug(ping_key: str, slug: str) -> Check:
+    """Find a check by the project's ping key and a slug or active alias.
+
+    Primary check slugs take precedence over aliases. Only pending and
+    migrated aliases route pings; expired aliases are treated as absent.
+    Mirrors Check.objects.get(): raises Check.DoesNotExist when neither a
+    primary slug nor an active alias matches, and
+    Check.MultipleObjectsReturned when several primary checks share the slug.
+    """
+
+    try:
+        return Check.objects.get(slug=slug, project__ping_key=ping_key)
+    except Check.DoesNotExist:
+        alias = (
+            SlugAlias.objects.filter(
+                slug=slug,
+                state__in=("pending", "migrated"),
+                project__ping_key=ping_key,
+            )
+            .select_related("owner")
+            .first()
+        )
+        if alias is None:
+            raise
+        return alias.owner
+
+
 class TokenBucket(models.Model):
     value = models.CharField(max_length=80, unique=True)
     tokens = models.FloatField(default=1.0)

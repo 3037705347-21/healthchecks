@@ -16,7 +16,14 @@ from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from django_stubs_ext import WithAnnotations
 
-from hc.api.models import Channel, Check, Flip, Notification, Ping
+from hc.api.models import (
+    Channel,
+    Check,
+    Flip,
+    Notification,
+    Ping,
+    SlugAlias,
+)
 from hc.lib.date import format_duration
 
 Lookups = Iterable[tuple[str, str]]
@@ -324,3 +331,21 @@ class NotificationsAdmin(ModelAdmin[Notification]):
 class FlipsAdmin(ModelAdmin[Flip]):
     list_display = ("id", "created", "processed", "owner", "old_status", "new_status")
     raw_id_fields = ("owner",)
+
+
+@admin.register(SlugAlias)
+class SlugAliasesAdmin(ModelAdmin[SlugAlias]):
+    list_display = (
+        "id",
+        "project",
+        "slug",
+        "new_slug",
+        "owner",
+        "state",
+        "created",
+        "rebinded",
+        "expired_at",
+    )
+    list_filter = ("state",)
+    raw_id_fields = ("project", "owner")
+    search_fields = ("slug", "new_slug", "project__owner__email")

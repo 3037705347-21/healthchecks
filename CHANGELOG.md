@@ -31,6 +31,7 @@ is that a crash in any child process causes a restart of all child processes.
 - Update the smtpd management command to use the minismtpd library
 - Update the Shell integration to use env variables instead of text substitution
 - Add ability to edit existing Shell integrations
+- Add the rebindslugs management command for batch old-slug to new-slug migration plans (pending/migrated/expired groups, heartbeat aliasing, resumable and source-reconciling)
 - Update the Docker image to use gunicorn instead of uWSGI (#1349, #1201)
 
 ### Bug Fixes
