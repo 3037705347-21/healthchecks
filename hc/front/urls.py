@@ -45,6 +45,9 @@ project_urls = [
     path("checks/add/", views.add_check, name="hc-add-check"),
     path("checks/status/", views.status, name="hc-status"),
     path("integrations/", views.channels, name="hc-channels"),
+    path("trash/", views.trash, name="hc-trash"),
+    path("trash/restore", views.trash_restore, name="hc-trash-restore"),
+    path("trash/purge", views.trash_purge, name="hc-trash-purge"),
 ]
 
 # /

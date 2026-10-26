@@ -45,13 +45,13 @@ class ChecksAdmin(ModelAdmin[Check]):
         "status",
         "last_start",
         "last_ping",
+        "deleted_at",
     )
-    list_filter = ("status", "kind", "last_ping", "last_start")
+    list_filter = ("status", "kind", "deleted_at", "last_ping", "last_start")
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[Check]:
-        qs = super().get_queryset(request)
-        qs = qs.annotate(owner_email=F("project__owner__email"))
-        return qs
+        # Include soft-deleted checks so they remain visible in the admin:
+        return Check.all_objects.annotate(owner_email=F("project__owner__email"))
 
     def project_(self, obj: WithAnnotations[Check, CheckAnnotations]) -> str:
         url = obj.project.get_absolute_url()

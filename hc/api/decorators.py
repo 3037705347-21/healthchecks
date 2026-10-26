@@ -110,7 +110,7 @@ def cors(*methods: str) -> Callable[[ViewFunc], ViewFunc]:
                 response = HttpResponse(status=405)
 
             response["Access-Control-Allow-Origin"] = "*"
-            response["Access-Control-Allow-Headers"] = "X-Api-Key"
+            response["Access-Control-Allow-Headers"] = "X-Api-Key, Idempotency-Key"
             response["Access-Control-Allow-Methods"] = methods_str
             response["Access-Control-Max-Age"] = "600"
             return response

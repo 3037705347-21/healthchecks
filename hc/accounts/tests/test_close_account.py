@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from django.contrib.auth.models import User
 
-from hc.api.models import Check
+from hc.api.models import Check, Ping
 from hc.payments.models import Subscription
 from hc.test import BaseTestCase
 
@@ -46,6 +46,22 @@ class CloseAccountTestCase(BaseTestCase):
 
         # Subscription should be gone
         self.assertFalse(Subscription.objects.exists())
+
+    def test_it_cascades_trashed_checks(self) -> None:
+        trashed = Check.objects.create(project=self.project)
+        Ping.objects.create(owner=trashed, n=1)
+        trashed.trash()
+
+        self.client.login(username="alice@example.org", password="password")
+        self.set_sudo_flag()
+
+        payload = {"confirmation": "alice@example.org"}
+        r = self.client.post("/accounts/close/", payload, follow=True)
+        self.assertRedirects(r, "/accounts/login/?account-closed=1")
+
+        self.assertFalse(User.objects.filter(username="alice").exists())
+        self.assertFalse(Check.all_objects.exists())
+        self.assertEqual(Ping.objects.count(), 0)
 
     def test_it_requires_confirmation(self) -> None:
         self.client.login(username="alice@example.org", password="password")

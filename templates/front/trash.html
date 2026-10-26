@@ -1,0 +1,155 @@
+{% extends "base_project.html" %}
+{% load humanize hc_extras %}
+
+{% block title %}Trash - {{ project }}{% endblock %}
+
+{% block content %}
+
+{% if messages %}
+<div class="row">
+    <div class="col-sm-12">
+        {% for message in messages %}
+        <p class="alert alert-{{ message.tags }}">{{ message }}</p>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<form id="restore-form" method="post" action="{% url 'hc-trash-restore' project.code %}">
+    {% csrf_token %}
+    <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+</form>
+<form id="purge-form" method="post" action="{% url 'hc-trash-purge' project.code %}">
+    {% csrf_token %}
+    <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+</form>
+
+<div class="row">
+    <div class="col-sm-12">
+        <h3>Trash
+            <small class="text-muted">deleted checks are retained for {{ retention_days }} days</small>
+        </h3>
+
+        {% if checks %}
+        <table class="table trash-table">
+            <tr>
+                <th class="th-restore">Restore</th>
+                <th class="th-purge">Delete</th>
+                <th class="th-name">Name</th>
+                <th class="hidden-xs">Integrations</th>
+                <th>Pings</th>
+                <th>Deleted</th>
+                <th>Expires</th>
+            </tr>
+            {% for check in checks %}
+            <tr id="{{ check.code }}" class="trash-row {% if check.is_expired %}expired{% endif %}">
+                <td>
+                    <input
+                        type="checkbox"
+                        class="restore-check batch-check"
+                        form="restore-form"
+                        name="uuids"
+                        value="{{ check.code }}"
+                        {% if not rw or check.is_expired %}disabled{% endif %}>
+                </td>
+                <td>
+                    <input
+                        type="checkbox"
+                        class="purge-check batch-check"
+                        form="purge-form"
+                        name="uuids"
+                        value="{{ check.code }}"
+                        {% if not rw %}disabled{% endif %}>
+                </td>
+                <td>
+                    <div class="trash-check-name {% if not check.name %}unnamed{% endif %}">
+                        {{ check.name|default:"unnamed"|break_underscore }}
+                    </div>
+                    {% for tag in check.tags_list %}
+                    <span class="label label-tag">{{ tag }}</span>
+                    {% endfor %}
+                    {% if check.is_expired %}
+                    <span class="label label-danger">Expired</span>
+                    {% endif %}
+                    <div class="text-muted"><small>{{ check.code }}</small></div>
+                </td>
+                <td class="hidden-xs">
+                    {% for channel in check.channel_set.all %}
+                    <span class="label label-default">{{ channel }}</span>
+                    {% empty %}
+                    <span class="text-muted">–</span>
+                    {% endfor %}
+                </td>
+                <td>{{ check.n_pings }}</td>
+                <td>{{ check.deleted_at|naturaltime }}</td>
+                <td>{{ check.trash_expires|date:"Y-m-d H:i" }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+
+        {% if rw %}
+        <div id="trash-actions">
+            <button
+                type="submit"
+                form="restore-form"
+                class="btn btn-primary"
+                id="restore-selected"
+                disabled>
+                Restore Selected
+            </button>
+            <button
+                type="submit"
+                form="purge-form"
+                class="btn btn-danger"
+                id="purge-selected"
+                disabled>
+                Delete Selected Forever
+            </button>
+        </div>
+        {% endif %}
+        {% else %}
+        <div class="alert alert-info">
+            The project <strong>{{ project }}</strong> does not have any checks in trash.
+        </div>
+        {% endif %}
+
+        <p style="margin-top: 20px;">
+            <a href="{% url 'hc-checks' project.code %}">&larr; Back to Checks</a>
+        </p>
+    </div>
+</div>
+
+<script>
+(function () {
+    "use strict";
+
+    function refresh(buttonId, selector) {
+        var checked = document.querySelectorAll(selector + ":checked").length;
+        var button = document.getElementById(buttonId);
+        if (button) {
+            button.disabled = checked === 0;
+        }
+    }
+
+    document.querySelectorAll(".restore-check").forEach(function (el) {
+        el.addEventListener("change", function () {
+            refresh("restore-selected", ".restore-check");
+        });
+    });
+    document.querySelectorAll(".purge-check").forEach(function (el) {
+        el.addEventListener("change", function () {
+            refresh("purge-selected", ".purge-check");
+        });
+    });
+
+    document.getElementById("purge-form").addEventListener("submit", function (e) {
+        var checked = this.querySelectorAll(".purge-check:checked").length;
+        if (checked > 0 && !confirm("Permanently delete " + checked + " check(s) " +
+            "and all their history? This cannot be undone.")) {
+            e.preventDefault();
+        }
+    });
+})();
+</script>
+
+{% endblock %}

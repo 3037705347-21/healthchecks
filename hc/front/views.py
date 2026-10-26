@@ -10,9 +10,9 @@ from collections.abc import Iterable
 from datetime import datetime
 from datetime import timedelta as td
 from itertools import islice
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 from urllib.parse import urlencode, urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from cronsim import CronSim
@@ -51,6 +51,7 @@ from hc.api.models import (
     Ping,
     prepare_durations,
 )
+from hc.api.trash import execute_batch
 from hc.front import forms
 from hc.front.templatetags.hc_extras import (
     down_title,
@@ -300,6 +301,9 @@ def checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         "timezones": all_timezones,
         "project": project,
         "num_available": project.num_checks_available(),
+        "num_trashed": Check.all_objects.filter(
+            project=project, deleted_at__isnull=False
+        ).count(),
         "sort": request.profile.sort,
         "selected_tags": selected_tags,
         "selected_statuses": selected_statuses,
@@ -338,6 +342,65 @@ def status(request: HttpRequest, code: UUID) -> HttpResponse:
     return JsonResponse(
         {"details": details, "tags": tags, "title": num_down_title(num_down)}
     )
+
+
+@login_required
+def trash(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    _refresh_last_active_date(request)
+    project, rw = _get_project_for_user(request, code)
+
+    q = Check.all_objects.filter(project=project, deleted_at__isnull=False)
+    checks = list(q.prefetch_related("channel_set").order_by("-deleted_at"))
+
+    ctx = {
+        "page": "trash",
+        "project": project,
+        "rw": rw,
+        "checks": checks,
+        "retention_days": settings.TRASH_RETENTION_DAYS,
+        "idempotency_key": uuid4().hex,
+    }
+    return render(request, "front/trash.html", ctx)
+
+
+def _trash_batch(
+    request: AuthenticatedHttpRequest, code: UUID, kind: Literal["restore", "purge"]
+) -> HttpResponse:
+    project = _get_rw_project_for_user(request, code)
+
+    result = execute_batch(
+        project,
+        kind=kind,
+        uuids=request.POST.getlist("uuids"),
+        key=request.POST.get("idempotency_key") or None,
+    )
+
+    if result.status_code == 200:
+        if kind == "restore":
+            n = len(result.body["restored"])
+            messages.success(request, f"Restored {n} check(s) from Trash.")
+        else:
+            n = len(result.body["purged"])
+            messages.success(request, f"Permanently deleted {n} check(s).")
+    else:
+        messages.error(
+            request,
+            result.body.get("error") or "Could not process the request",
+        )
+
+    return redirect("hc-trash", project.code)
+
+
+@require_POST
+@login_required
+def trash_restore(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    return _trash_batch(request, code, "restore")
+
+
+@require_POST
+@login_required
+def trash_purge(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    return _trash_batch(request, code, "purge")
 
 
 @login_required
@@ -873,7 +936,11 @@ def remove_check(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     project = check.project
-    check.rename_and_delete()
+    check.trash()
+    project.update_next_nag_dates()
+    messages.success(
+        request, "Moved to Trash. You can restore it from the project trash."
+    )
     return redirect("hc-checks", project.code)
 
 

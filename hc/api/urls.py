@@ -47,6 +47,13 @@ slug_urls = [
 
 api_urls = [
     path("checks/", views.checks),
+    path("checks/trash/", views.trash_list, name="hc-api-trash-list"),
+    path(
+        "checks/trash/restore",
+        views.trash_restore,
+        name="hc-api-trash-restore",
+    ),
+    path("checks/trash/purge", views.trash_purge, name="hc-api-trash-purge"),
     path("checks/<uuid:code>", views.single, name="hc-api-single"),
     path("checks/<sha1:unique_key>", views.get_check_by_unique_key),
     path("checks/<uuid:code>/pause", views.pause, name="hc-api-pause"),

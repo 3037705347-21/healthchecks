@@ -5,10 +5,19 @@ from datetime import timedelta as td
 from unittest.mock import Mock, patch
 
 import time_machine
+from django.conf import settings
+from django.db import IntegrityError
 from django.test.utils import override_settings
 from django.utils.timezone import now
 
-from hc.api.models import Channel, Check, Flip, Notification, Ping
+from hc.api.models import (
+    Channel,
+    Check,
+    Flip,
+    Notification,
+    Ping,
+    TrashBatchOperation,
+)
 from hc.test import BaseTestCase
 
 CURRENT_TIME = datetime(2020, 1, 15, tzinfo=timezone.utc)
@@ -456,3 +465,100 @@ class CheckModelTestCase(BaseTestCase):
 
         # rename_and_delete should handle an already deleted check gracefully:
         same_check.rename_and_delete()
+
+
+class TrashModelTestCase(BaseTestCase):
+    def test_trash_hides_check_from_default_manager(self) -> None:
+        check = Check.objects.create(project=self.project)
+
+        check.trash()
+
+        self.assertEqual(Check.objects.count(), 0)
+        self.assertEqual(Check.all_objects.count(), 1)
+        with self.assertRaises(Check.DoesNotExist):
+            Check.objects.get(id=check.id)
+
+        fetched = Check.all_objects.get(id=check.id)
+        self.assertIsNotNone(fetched.deleted_at)
+
+    def test_trash_preserves_related_data_and_cancels_flips(self) -> None:
+        check = Check.objects.create(project=self.project, alert_after=now())
+        Ping.objects.create(owner=check, n=1)
+        channel = Channel.objects.create(project=self.project, kind="email")
+        channel.checks.add(check)
+        Notification.objects.create(owner=check, channel=channel, check_status="down")
+        # An unprocessed flip pending in the sendalerts queue:
+        Flip.objects.create(
+            owner=check, created=now(), old_status="up", new_status="down"
+        )
+
+        through = Channel.checks.through
+        before = {
+            "pings": Ping.objects.count(),
+            "flips": Flip.objects.count(),
+            "notifications": Notification.objects.count(),
+            "m2m": through.objects.count(),
+        }
+
+        check.trash()
+
+        self.assertEqual(Ping.objects.count(), before["pings"])
+        self.assertEqual(Flip.objects.count(), before["flips"])
+        self.assertEqual(Notification.objects.count(), before["notifications"])
+        # The M2M through row is kept so the assignment can be restored:
+        self.assertEqual(through.objects.count(), before["m2m"])
+        self.assertTrue(through.objects.filter(channel=channel, check=check).exists())
+
+        check.refresh_from_db()
+        self.assertIsNone(check.alert_after)
+        self.assertIsNotNone(check.deleted_at)
+        self.assertEqual(Flip.objects.filter(processed=None).count(), 0)
+
+    def test_trash_expires_and_is_expired(self) -> None:
+        check = Check.objects.create(project=self.project)
+        self.assertIsNone(check.trash_expires())
+        self.assertFalse(check.is_expired())
+
+        check.trash()
+        assert check.deleted_at is not None
+        expected = check.deleted_at + settings.TRASH_RETENTION
+        self.assertEqual(check.trash_expires(), expected)
+        self.assertFalse(check.is_expired())
+
+        Check.all_objects.filter(id=check.id).update(deleted_at=now() - td(days=31))
+        self.assertTrue(Check.all_objects.get(id=check.id).is_expired())
+
+        Check.all_objects.filter(id=check.id).update(deleted_at=now() - td(days=10))
+        self.assertFalse(Check.all_objects.get(id=check.id).is_expired())
+
+    def test_trash_does_not_reset_retention_clock(self) -> None:
+        check = Check.objects.create(project=self.project)
+        check.trash()
+        first_deleted_at = check.deleted_at
+
+        # Calling trash() again must not move the expiry date:
+        check.trash()
+        self.assertEqual(
+            Check.all_objects.get(id=check.id).deleted_at, first_deleted_at
+        )
+
+
+class TrashBatchOperationModelTestCase(BaseTestCase):
+    def test_project_key_pair_is_unique(self) -> None:
+        TrashBatchOperation.objects.create(
+            project=self.project, key="k1", kind="restore", codes="[]"
+        )
+
+        with self.assertRaises(IntegrityError):
+            TrashBatchOperation.objects.create(
+                project=self.project, key="k1", kind="purge", codes="[]"
+            )
+
+    def test_same_key_is_allowed_in_another_project(self) -> None:
+        TrashBatchOperation.objects.create(
+            project=self.project, key="k1", kind="restore", codes="[]"
+        )
+        TrashBatchOperation.objects.create(
+            project=self.bobs_project, key="k1", kind="restore", codes="[]"
+        )
+        self.assertEqual(TrashBatchOperation.objects.count(), 2)

@@ -122,6 +122,14 @@ class MetricsTestCase(BaseTestCase):
         self.assertContains(r, f"hc_check_up{alice_spec} 1")
         self.assertContains(r, f"hc_check_paused{alice_spec} 1")
 
+    def test_it_excludes_trashed_checks(self) -> None:
+        self.check.trash()
+
+        r = self.client.get(self.url)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotContains(r, "Alice Was Here")
+        self.assertContains(r, "hc_checks_total 0")
+
     def test_it_reports_hc_check_grace(self) -> None:
         self.check.timeout = td(minutes=10)
         self.check.grace = td(minutes=10)

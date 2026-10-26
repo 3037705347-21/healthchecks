@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Mapping
+from datetime import timedelta as td
 from pathlib import Path
 from typing import Any, overload
 from urllib.parse import urlparse
@@ -271,6 +272,10 @@ MASTER_BADGE_LABEL = os.getenv("MASTER_BADGE_LABEL", SITE_NAME)
 PING_ENDPOINT = os.getenv("PING_ENDPOINT", SITE_ROOT + "/ping/")
 PING_EMAIL_DOMAIN = os.getenv("PING_EMAIL_DOMAIN", "localhost")
 PING_BODY_LIMIT = envint("PING_BODY_LIMIT", "10000")
+# How long checks are retained in the project trash before they are
+# permanently deleted by the prunetrashedchecks management command:
+TRASH_RETENTION_DAYS = envint("TRASH_RETENTION_DAYS", "30")
+TRASH_RETENTION = td(days=TRASH_RETENTION_DAYS or 30)
 # If PING_BODY_LIMIT is higher than the default value for DATA_UPLOAD_MAX_MEMORY_SIZE,
 # then we need to bump up DATA_UPLOAD_MAX_MEMORY_SIZE too:
 if PING_BODY_LIMIT and PING_BODY_LIMIT > 2621440:

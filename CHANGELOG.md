@@ -25,6 +25,16 @@ container terminates. If docker is configured to restart the container, the net 
 is that a crash in any child process causes a restart of all child processes.
 
 ### Improvements
+- Deleting a check now moves it to the project's trash instead of permanently
+  deleting it immediately. Trashed checks retain their ping history, status
+  flips, notifications and channel assignments, and can be restored (with the
+  original UUID and ping URLs) or permanently purged in batches from the new
+  Trash page or via the `GET /api/v3/checks/trash/`,
+  `POST /api/v3/checks/trash/restore` and `POST /api/v3/checks/trash/purge`
+  API endpoints. Batch requests support the `Idempotency-Key` header. Restored
+  checks return in the paused state. Items are retained for 30 days
+  (`TRASH_RETENTION_DAYS` setting) and physically removed by the new
+  `prunetrashedchecks` management command.
 - Fix project invite email template to mangle URLs in project names
 - Fix transfer request email template to mangle URLs in project names
 - Update HTTP notification transports to accept HTTP 205 (#1347)

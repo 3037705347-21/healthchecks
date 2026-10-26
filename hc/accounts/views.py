@@ -709,8 +709,7 @@ def close(request: AuthenticatedHttpRequest) -> HttpResponse:
 @login_required
 def remove_project(request: AuthenticatedHttpRequest, code: str) -> HttpResponse:
     project = get_object_or_404(Project, code=code, owner=request.user)
-    for check in project.check_set.all():
-        check.rename_and_delete()
+    # Cascades to live checks as well as to checks currently in the trash
     project.delete()
     return redirect("hc-index")
 

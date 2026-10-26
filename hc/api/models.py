@@ -189,6 +189,20 @@ class DowntimeRecorder:
                 return
 
 
+class CheckQuerySet(models.QuerySet["Check"]):
+    pass
+
+
+class CheckManager(models.Manager["Check"]):
+    """Manager which only returns live (not soft-deleted) checks."""
+
+    def get_queryset(self) -> QuerySet[Check]:
+        return super().get_queryset().filter(deleted_at__isnull=True)
+
+
+TRASH_BATCH_KINDS = (("restore", "Restore"), ("purge", "Purge"))
+
+
 class Check(models.Model):
     name = models.CharField(max_length=100, blank=True)
     slug = models.CharField(max_length=100, blank=True)
@@ -221,11 +235,21 @@ class Check(models.Model):
     has_confirmation_link = models.BooleanField(default=False)
     alert_after = models.DateTimeField(null=True, blank=True, editable=False)
     status = models.CharField(max_length=6, choices=STATUSES, default="new")
+    # Set when the check is moved to the project trash. NULL means the check
+    # is live. Soft-deleted checks are excluded from Check.objects but can be
+    # accessed via Check.all_objects.
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     # Used to pass downtime data to report templates. Not persisted to db.
     past_downtimes: list[DowntimeRecord] | None = None
 
+    objects = CheckManager()
+    # Includes soft-deleted checks. Also used as the base manager so that
+    # project/account deletion cascades collect trashed checks too.
+    all_objects = models.Manager["Check"]()
+
     class Meta:
+        base_manager_name = "all_objects"
         indexes = (
             # Index for the alert_after field. Exclude rows with status=down.
             # Used in the sendalerts management command.
@@ -235,6 +259,10 @@ class Check(models.Model):
                 condition=~models.Q(status="down"),
             ),
             models.Index(fields=["project_id", "slug"], name="api_check_project_slug"),
+            # Used by the project trash page and by batch restore/purge:
+            models.Index(
+                fields=["project_id", "deleted_at"], name="api_check_project_trash"
+            ),
         )
 
     def __str__(self) -> str:
@@ -405,6 +433,45 @@ class Check(models.Model):
         except IntegrityError:
             # Retry once
             q.delete()
+
+    def trash(self) -> None:
+        """Move the check to the project trash (soft delete).
+
+        Marks the check as deleted and clears alert_after so sendalerts does
+        not pick it up. Any unprocessed flips are marked as processed so no
+        notifications get sent while the check is in trash. The check row and
+        all of its related data (pings, flips, notifications, channel
+        assignments) are kept intact until the check is restored or purged.
+        """
+
+        frozen_now = now()
+        with transaction.atomic():
+            # Guard with deleted_at__isnull=True so calling trash() twice does
+            # not reset the retention clock.
+            updated = Check.all_objects.filter(
+                id=self.id, deleted_at__isnull=True
+            ).update(deleted_at=frozen_now, alert_after=None)
+            self.flip_set.filter(processed=None).update(processed=frozen_now)
+
+        if updated:
+            self.deleted_at = frozen_now
+        self.alert_after = None
+
+    def trash_expires(self) -> datetime | None:
+        """Return when the check's trash retention period ends."""
+
+        if self.deleted_at is None:
+            return None
+
+        return self.deleted_at + settings.TRASH_RETENTION
+
+    def is_expired(self) -> bool:
+        """Return True if the trashed check is past its retention period."""
+
+        if self.deleted_at is None:
+            return False
+
+        return self.deleted_at + settings.TRASH_RETENTION <= now()
 
     def assign_all_channels(self) -> None:
         channels = Channel.objects.filter(project=self.project)
@@ -1432,6 +1499,35 @@ class Flip(models.Model):
             return self.created - prev_flip.created
 
         return None
+
+
+class TrashBatchOperation(models.Model):
+    """Idempotency record for batch restore/purge operations.
+
+    A row is reserved before the batch is executed. Repeating the same request
+    with the same (project, key) replays the stored response instead of
+    executing the batch a second time.
+    """
+
+    project = models.ForeignKey(Project, models.CASCADE)
+    key = models.CharField(max_length=64)
+    kind = models.CharField(max_length=7, choices=TRASH_BATCH_KINDS)
+    # Sorted, deduplicated JSON list of check UUID strings
+    codes = models.TextField()
+    response_code = models.IntegerField(null=True, blank=True)
+    response = models.TextField(blank=True)
+    created = models.DateTimeField(default=now)
+    completed = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = (
+            models.UniqueConstraint(
+                fields=["project", "key"], name="api_tbo_project_key"
+            ),
+        )
+
+    def __str__(self) -> str:
+        return f"{self.kind} batch {self.key} in project {self.project_id}"
 
 
 class TokenBucket(models.Model):

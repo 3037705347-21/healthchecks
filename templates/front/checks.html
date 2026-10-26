@@ -12,6 +12,16 @@
 
 {% block content %}
 
+{% if messages %}
+<div class="row">
+    <div class="col-sm-12">
+        {% for message in messages %}
+        <p class="alert alert-{{ message.tags }}">{{ message }}</p>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
 {% if num_available < 0 %}
 <div class="row">
     <div class="col-sm-12">
@@ -144,8 +154,15 @@
         title="{{ checks|length }} in use, {{ num_available }} available"
         {% if num_available <= 0 %}disabled{% endif %}>
             Add Check
-        </button>
+    </button>
     {% endif %}
+    <a
+        class="btn btn-default"
+        id="trash-link"
+        href="{% url 'hc-trash' project.code %}"
+        title="Deleted checks retained for restore">
+            Trash ({{ num_trashed }})
+    </a>
 </div>
 
 
@@ -172,6 +189,9 @@
                     Add Check
             </button>
             {% endif %}
+            <a class="btn btn-default" href="{% url 'hc-trash' project.code %}">
+                Trash ({{ num_trashed }})
+            </a>
         </div>
     </div>
 </div>

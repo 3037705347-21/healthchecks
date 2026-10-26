@@ -39,6 +39,7 @@ from hc.accounts.models import Profile, Project
 from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
 from hc.api.forms import FlipsFiltersForm
 from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
+from hc.api.trash import execute_batch
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
@@ -477,6 +478,59 @@ def channels(request: ApiRequest) -> JsonResponse:
     return JsonResponse({"channels": channels})
 
 
+def _trash_check_to_dict(check: Check) -> dict[str, Any]:
+    expires_at = check.trash_expires()
+    return {
+        "uuid": str(check.code),
+        "name": check.name,
+        "slug": check.slug,
+        "tags": check.tags,
+        "status": check.status,
+        "n_pings": check.n_pings,
+        "deleted_at": check.deleted_at.isoformat() if check.deleted_at else None,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "channels": check.channels_str(),
+    }
+
+
+@cors("GET")
+@csrf_exempt
+@authorize_read
+def trash_list(request: ApiRequest) -> JsonResponse:
+    q = Check.all_objects.filter(
+        project=request.project, deleted_at__isnull=False
+    ).order_by("-deleted_at")
+    channel_q = Channel.objects.only("code")
+    q = q.prefetch_related(Prefetch("channel_set", queryset=channel_q))
+    return JsonResponse({"checks": [_trash_check_to_dict(check) for check in q]})
+
+
+def _trash_batch(
+    request: ApiRequest, kind: Literal["restore", "purge"]
+) -> JsonResponse:
+    result = execute_batch(
+        request.project,
+        kind=kind,
+        uuids=request.json.get("uuids"),
+        key=request.headers.get("Idempotency-Key"),
+    )
+    return JsonResponse(result.body, status=result.status_code)
+
+
+@cors("POST")
+@csrf_exempt
+@authorize
+def trash_restore(request: ApiRequest) -> JsonResponse:
+    return _trash_batch(request, "restore")
+
+
+@cors("POST")
+@csrf_exempt
+@authorize
+def trash_purge(request: ApiRequest) -> JsonResponse:
+    return _trash_batch(request, "purge")
+
+
 @authorize_read
 def get_check(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
@@ -525,7 +579,10 @@ def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    check.rename_and_delete()
+    # Move to the project trash. The check, its ping history, flips and
+    # channel assignments are retained until it is restored or purged.
+    check.trash()
+    check.project.update_next_nag_dates()
     return JsonResponse(check.to_dict(v=request.v))
 
 
