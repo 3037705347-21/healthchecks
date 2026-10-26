@@ -31,6 +31,7 @@ is that a crash in any child process causes a restart of all child processes.
 - Update the smtpd management command to use the minismtpd library
 - Update the Shell integration to use env variables instead of text substitution
 - Add ability to edit existing Shell integrations
+- Add the mergechannels management command for merging duplicate channels
 - Update the Docker image to use gunicorn instead of uWSGI (#1349, #1201)
 
 ### Bug Fixes
