@@ -16,7 +16,16 @@ from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from django_stubs_ext import WithAnnotations
 
-from hc.api.models import Channel, Check, Flip, Notification, Ping
+from hc.api.models import (
+    Channel,
+    Check,
+    Flip,
+    Notification,
+    Ping,
+    RedactionJob,
+    RedactionRule,
+    RedactionState,
+)
 from hc.lib.date import format_duration
 
 Lookups = Iterable[tuple[str, str]]
@@ -324,3 +333,38 @@ class NotificationsAdmin(ModelAdmin[Notification]):
 class FlipsAdmin(ModelAdmin[Flip]):
     list_display = ("id", "created", "processed", "owner", "old_status", "new_status")
     raw_id_fields = ("owner",)
+
+
+@admin.register(RedactionRule)
+class RedactionRulesAdmin(ModelAdmin[RedactionRule]):
+    list_display = ("id", "pattern", "replacement", "created")
+    search_fields = ("pattern", "replacement")
+
+
+@admin.register(RedactionJob)
+class RedactionJobsAdmin(ModelAdmin[RedactionJob]):
+    list_display = (
+        "id",
+        "status",
+        "fingerprint_",
+        "cursor",
+        "processed",
+        "changed",
+        "created",
+        "updated",
+    )
+    list_filter = ("status",)
+    filter_horizontal = ("checks",)
+    readonly_fields = ("fingerprint", "cursor", "processed", "changed")
+
+    def fingerprint_(self, obj: RedactionJob) -> str:
+        return obj.fingerprint[:8]
+
+
+@admin.register(RedactionState)
+class RedactionStatesAdmin(ModelAdmin[RedactionState]):
+    list_display = ("id", "ping", "fingerprint_", "updated")
+    raw_id_fields = ("ping",)
+
+    def fingerprint_(self, obj: RedactionState) -> str:
+        return obj.fingerprint[:8]

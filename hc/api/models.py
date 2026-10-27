@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import socket
 import uuid
 from collections.abc import Sequence
@@ -17,6 +18,7 @@ from cronsim import CronSim
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.humanize.templatetags.humanize import naturaltime
+from django.core.exceptions import ValidationError
 from django.core.mail import mail_admins
 from django.core.signing import TimestampSigner
 from django.db import IntegrityError, models, transaction
@@ -1585,3 +1587,132 @@ class TokenBucket(models.Model):
         # Use force=True, we are recording the S3 error after the error already
         # happened, and want to record it even if the tokens field would go negative.
         TokenBucket.authorize("s3_get_object_error", 3, 60, force=True)
+
+
+# Replacement used when redacting matched fragments unless a rule specifies
+# its own replacement. The token must not itself match any realistic rule
+# pattern, so that re-processing an already redacted body is idempotent.
+DEFAULT_REDACTION = "[REDACTED]"
+
+REDACTION_JOB_STATUSES = (
+    ("pending", "Pending"),
+    ("running", "Running"),
+    ("done", "Done"),
+    ("failed", "Failed"),
+)
+
+
+class RedactionRule(models.Model):
+    """A single redaction rule: a regular expression and its replacement.
+
+    All rules together form "the same set of redaction rules" which gets
+    applied continuously to historical ping bodies within a check scope.
+    Rules are applied to raw body bytes (pattern and replacement are encoded
+    as UTF-8), so body fragments that no rule matches stay byte-for-byte
+    unchanged.
+    """
+
+    pattern = models.CharField(max_length=500)
+    replacement = models.CharField(max_length=200, default=DEFAULT_REDACTION)
+    created = models.DateTimeField(default=now)
+
+    def __str__(self) -> str:
+        return f"{self.pattern} -> {self.replacement}"
+
+    def clean(self) -> None:
+        if not self.pattern:
+            raise ValidationError({"pattern": "Pattern must not be empty"})
+        if not self.replacement:
+            raise ValidationError({"replacement": "Replacement must not be empty"})
+        try:
+            re.compile(self.pattern.encode())
+        except re.error as e:
+            raise ValidationError({"pattern": f"Invalid regular expression: {e}"})
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.clean()
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def entries(cls) -> list[tuple[str, str]]:
+        """Return all rules as (pattern, replacement) pairs, in stable order."""
+        rows = cls.objects.order_by("id").values_list("pattern", "replacement")
+        return [(p, r) for p, r in rows]
+
+    @classmethod
+    def fingerprint(cls) -> str:
+        """Return a hash of the current rule set.
+
+        The fingerprint changes whenever a rule is added or modified. It is
+        used for deciding which ping bodies are already processed with the
+        current rule set (and therefore must not be re-processed).
+        """
+        # Sort so that the fingerprint does not depend on insertion order
+        payload = "\x1e".join(
+            f"{p}\x1f{r}" for p, r in sorted(cls.entries())
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    @classmethod
+    def compiled(cls) -> list[tuple[re.Pattern[bytes], bytes]]:
+        """Return compiled rules ready for byte-level substitution."""
+        return [
+            (re.compile(p.encode()), r.encode()) for p, r in cls.entries()
+        ]
+
+
+class RedactionState(models.Model):
+    """Records which rule set was last successfully applied to a ping body.
+
+    A row exists only for pings whose body was fully read and written back
+    (or confirmed to need no changes). The row is created only after the
+    write-back succeeds, so a failed read or write never marks a ping as
+    processed.
+    """
+
+    ping = models.OneToOneField(Ping, models.CASCADE, related_name="redaction_state")
+    fingerprint = models.CharField(max_length=64)
+    updated = models.DateTimeField(default=now)
+
+    def __str__(self) -> str:
+        return f"ping {self.ping_id} @ {self.fingerprint[:8]}"
+
+
+class RedactionJob(models.Model):
+    """A batch redaction run scoped to a set of checks and a time range.
+
+    A job can be re-run continuously as rules evolve. It resumes from the
+    last confirmed event (cursor), and only processes pings which have not
+    been processed with the current rule set yet.
+    """
+
+    checks = models.ManyToManyField(Check)
+    start = models.DateTimeField(null=True, blank=True)
+    end = models.DateTimeField(null=True, blank=True)
+    # Fingerprint of the rule set the job is currently processing.
+    fingerprint = models.CharField(max_length=64, blank=True)
+    # ID of the last ping confirmed processed in this job.
+    cursor = models.BigIntegerField(null=True, blank=True)
+    status = models.CharField(
+        max_length=8, choices=REDACTION_JOB_STATUSES, default="pending"
+    )
+    processed = models.IntegerField(default=0)
+    changed = models.IntegerField(default=0)
+    created = models.DateTimeField(default=now)
+    updated = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"RedactionJob {self.id} ({self.status})"
+
+    def run(self, limit: int | None = None) -> tuple[int, int]:
+        """Process pending pings within the job's scope.
+
+        Returns a (processed, changed) tuple for this invocation. On a body
+        read/write failure marks the job as failed and re-raises; the cursor
+        stays at the last confirmed event so the next invocation resumes from
+        the failed event.
+        """
+        # Import here to avoid a circular import at module load time
+        from hc.api.redaction import process_job
+
+        return process_job(self, limit=limit)
