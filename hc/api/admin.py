@@ -16,7 +16,14 @@ from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from django_stubs_ext import WithAnnotations
 
-from hc.api.models import Channel, Check, Flip, Notification, Ping
+from hc.api.models import (
+    Channel,
+    Check,
+    Flip,
+    Notification,
+    Ping,
+    RebuildProgress,
+)
 from hc.lib.date import format_duration
 
 Lookups = Iterable[tuple[str, str]]
@@ -323,4 +330,19 @@ class NotificationsAdmin(ModelAdmin[Notification]):
 @admin.register(Flip)
 class FlipsAdmin(ModelAdmin[Flip]):
     list_display = ("id", "created", "processed", "owner", "old_status", "new_status")
+    raw_id_fields = ("owner",)
+
+
+@admin.register(RebuildProgress)
+class RebuildProgressAdmin(ModelAdmin[RebuildProgress]):
+    list_display = (
+        "owner",
+        "last_ping_id",
+        "last_ping_ts",
+        "status",
+        "anchored",
+        "completed",
+        "stop_reason",
+        "updated",
+    )
     raw_id_fields = ("owner",)

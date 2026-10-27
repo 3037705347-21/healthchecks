@@ -151,6 +151,22 @@ class CheckDict(TypedDict):
 
 
 @dataclass
+class RebuildResult:
+    # Number of ping rows incorporated during this pass
+    processed: int = 0
+    # Number of Flip rows removed from the rebuilt window
+    flips_removed: int = 0
+    # Number of Flip rows created from the ping sequence
+    flips_created: int = 0
+    # True when the rebuild caught up with the ping log and the Check's
+    # current-state fields were rewritten
+    completed: bool = False
+    # Non-empty when the rebuild had to stop before reaching the end
+    # ("gap", "schedule", "unconfirmed", "paused", "no_pings")
+    stop_reason: str = ""
+
+
+@dataclass
 class DowntimeRecord:
     boundary: datetime  # The start of this time interval (timezone-aware)
     tz: str  # For calculating total seconds in a month
@@ -670,6 +686,327 @@ class Check(models.Model):
         flip.new_status = new_status
         flip.reason = reason
         flip.save()
+
+    def rebuild_state(
+        self, *, margin: td = td(minutes=5), batch_size: int = 1000
+    ) -> RebuildResult:
+        """Rebuild current state and Flip rows from the check's ping sequence.
+
+        This recovers a Check whose status / last ping / downtime records no
+        longer match its Ping history (for example after a database migration).
+        It must be called inside ``transaction.atomic()`` and with the Check
+        row locked (``select_for_update()``), same as Check.ping().
+
+        Safety properties:
+
+        * Only history older than ``now() - margin`` is settled in one pass.
+          Pings arriving while the rebuild is running are in the live tail and
+          are never read or overwritten; later passes pick them up.
+        * All Flip rows created here are marked as processed, so sendalerts
+          does not re-send notifications for state changes in the past.
+        * Pause/resume Flip rows are preserved and taken into account.
+        * If the ping sequence has a gap (missing ``n`` values from pruning)
+          or the schedule does not yield a unique deadline, the pass stops at
+          the last confirmed position. The RebuildProgress row remembers it,
+          so repeated runs resume and converge incrementally.
+        """
+
+        result = RebuildResult()
+        frozen_now = now()
+        horizon = frozen_now - margin
+
+        latest = (
+            Ping.objects.filter(owner_id=self.id)
+            .order_by("-id")
+            .only("id", "created")
+            .first()
+        )
+        if latest is None:
+            # No pings to reconstruct anything from.
+            result.stop_reason = "no_pings"
+            return result
+
+        # "final" means the live tail is empty: even the newest ping is older
+        # than the safety margin. Only then do we adopt the current-state
+        # fields, so concurrent heartbeats can never be overwritten.
+        final = latest.created <= horizon
+
+        progress, _ = RebuildProgress.objects.get_or_create(
+            owner=self,
+            defaults={"last_ping_id": 0, "last_ping_ts": self.created},
+        )
+
+        cp_id = progress.last_ping_id
+        cp_ts = progress.last_ping_ts
+
+        q = Ping.objects.filter(owner_id=self.id, id__gt=cp_id)
+        if not final:
+            q = q.filter(created__lte=horizon)
+        pings = list(
+            q.order_by("id").only("id", "created", "kind", "n", "rid")[:batch_size]
+        )
+
+        # Pause/resume flips are user actions which cannot be derived from
+        # pings. Preserve them (never delete) and replay them as state events.
+        external = list(
+            self.flip_set.filter(
+                new_status__in=("paused", "new"),
+                created__gt=cp_ts,
+                created__lte=horizon,
+            ).order_by("created")
+        )
+
+        # Replace the up/down flips in the settled window; keep pause/resume
+        # flips. The window is (checkpoint, horizon]; the checkpoint only moves
+        # forward, so every flip is rewritten at most once (plus the open
+        # downtime flip, which is re-seeded from the checkpoint below).
+        window_q = self.flip_set.filter(created__gt=cp_ts, created__lte=horizon)
+        window_q = window_q.exclude(new_status__in=("paused", "new"))
+        result.flips_removed = window_q.count()
+        window_q.delete()
+
+        # Simulated state, resumed from the checkpoint
+        status = progress.status
+        last_ping = progress.last_ping_dt
+        last_start = progress.last_start_dt
+        last_start_rid = progress.last_start_rid
+        last_duration = progress.last_duration
+        down_since = progress.down_since
+        down_old = progress.down_old_status
+        anchored = progress.anchored
+        boundary_uncertain = progress.boundary_uncertain
+
+        if cp_id == 0 and pings:
+            first = pings[0]
+            # n == 1 means we hold the full lifecycle from the beginning.
+            # A missing or >1 first n means older pings were pruned: the
+            # status before the first retained ping is unknowable.
+            if first.n is None or first.n > 1:
+                boundary_uncertain = True
+                anchored = False
+            else:
+                anchored = True
+
+        # An unsaved scratch Check lets us reuse the exact deadline logic
+        # (timeout, grace, cron, oncalendar, running start) against the
+        # simulated state, without touching the database.
+        scratch = Check(
+            kind=self.kind,
+            timeout=self.timeout,
+            grace=self.grace,
+            schedule=self.schedule,
+            tz=self.tz,
+        )
+
+        def calc_deadline() -> datetime | None:
+            scratch.status = status
+            scratch.last_ping = last_ping
+            scratch.last_start = last_start
+            scratch.last_start_rid = last_start_rid
+            return scratch.going_down_after()
+
+        new_flips: list[Flip] = []
+
+        def emit(old_status: str, new_status: str, when: datetime, reason: str) -> None:
+            result.flips_created += 1
+            new_flips.append(
+                Flip(
+                    owner=self,
+                    created=when,
+                    # Mark as processed: historical flips are only used for
+                    # state and statistics, never for re-sending alerts.
+                    processed=when,
+                    old_status=old_status,
+                    new_status=new_status,
+                    reason=reason,
+                )
+            )
+
+        def settle_timeout(when: datetime) -> bool:
+            """Flip to down at the deadline if it is due at or before ``when``."""
+            nonlocal status, down_since, down_old
+            try:
+                deadline = calc_deadline()
+            except Exception:
+                # Schedule cannot be evaluated unambiguously: stop.
+                return False
+            if deadline is not None and when >= deadline:
+                if anchored:
+                    emit(status, "down", deadline, "timeout")
+                down_old = status
+                status = "down"
+                down_since = deadline
+            return True
+
+        # Re-seed an open downtime episode whose flip time is in the window
+        # but not derivable from any ping (a timeout after the last ping).
+        if (
+            status == "down"
+            and down_since is not None
+            and down_old
+            and cp_ts < down_since <= horizon
+            and anchored
+        ):
+            emit(down_old, "down", down_since, "timeout")
+
+        stop_reason = ""
+        prev_n: int | None = progress.last_n
+        processed = 0
+        ext_i = 0
+
+        for p in pings:
+            if prev_n is not None and (p.n is None or p.n != prev_n + 1):
+                # Missing pings in the middle of the sequence: the state
+                # across the gap cannot be determined uniquely.
+                stop_reason = "gap"
+                break
+
+            # Replay pause/resume events due at or before this ping
+            while ext_i < len(external) and external[ext_i].created <= p.created:
+                ef = external[ext_i]
+                if not settle_timeout(ef.created):
+                    stop_reason = "schedule"
+                    break
+                if ef.new_status == "paused":
+                    status, last_start = "paused", None
+                else:  # resume: status becomes "new", running/heartbeat reset
+                    status, last_start, last_ping, last_duration = (
+                        "new",
+                        None,
+                        None,
+                        None,
+                    )
+                down_since, down_old = None, ""
+                ext_i += 1
+            if stop_reason:
+                break
+
+            if not settle_timeout(p.created):
+                stop_reason = "schedule"
+                break
+
+            kind = p.kind
+            if kind == "start":
+                last_start = p.created
+                last_start_rid = p.rid
+            elif kind in (None, "fail"):
+                # Mirror Check.ping() exactly:
+                last_ping = p.created
+                last_duration = None
+                if last_start:
+                    if last_start_rid == p.rid:
+                        last_duration = p.created - last_start
+                        last_start = None
+                    elif kind == "fail" or p.rid is None:
+                        last_start = None
+
+                target = "down" if kind == "fail" else "up"
+                if status != target:
+                    # The first success/fail after a truncated prefix anchors
+                    # the status, but the transition itself is unknowable.
+                    if anchored:
+                        reason = "fail" if kind == "fail" else ""
+                        emit(status, target, p.created, reason)
+                    anchored = True
+                    if target == "down":
+                        down_old, down_since = status, p.created
+                    else:
+                        down_old, down_since = "", None
+                    status = target
+            # "ign" and "log" pings do not affect state
+            prev_n = p.n
+            processed += 1
+
+        # Replay any remaining pause/resume events, then settle an open
+        # timeout episode up to the horizon.
+        if not stop_reason:
+            while ext_i < len(external):
+                ef = external[ext_i]
+                if not settle_timeout(ef.created):
+                    stop_reason = "schedule"
+                    break
+                if ef.new_status == "paused":
+                    status, last_start = "paused", None
+                else:
+                    status, last_start, last_ping, last_duration = (
+                        "new",
+                        None,
+                        None,
+                        None,
+                    )
+                down_since, down_old = None, ""
+                ext_i += 1
+
+        if not stop_reason:
+            # A deadline <= horizon is confirmed: on a non-final pass a ping
+            # exists beyond the horizon (the live tail), and on a final pass
+            # the horizon itself proves the grace period elapsed with no ping.
+            try:
+                deadline = calc_deadline()
+            except Exception:
+                deadline = None
+                stop_reason = "schedule"
+            if deadline is not None and deadline <= horizon and anchored:
+                emit(status, "down", deadline, "timeout")
+                down_old = status
+                status = "down"
+                down_since = deadline
+
+        if processed:
+            last = pings[processed - 1]
+            cp_id = last.id
+            cp_ts = last.created
+
+        adopted = False
+        if final and not stop_reason:
+            if not anchored:
+                stop_reason = "unconfirmed"
+            elif self.status == "paused" and status != "paused":
+                # Never silently override a manual pause.
+                stop_reason = "paused"
+            else:
+                self.status = status
+                self.last_ping = last_ping
+                self.last_start = last_start
+                self.last_start_rid = last_start_rid
+                self.last_duration = last_duration
+                self.alert_after = None if status == "down" else calc_deadline()
+                self.save(
+                    update_fields=(
+                        "status",
+                        "last_ping",
+                        "last_start",
+                        "last_start_rid",
+                        "last_duration",
+                        "alert_after",
+                    )
+                )
+                adopted = True
+
+        progress.last_ping_id = cp_id
+        progress.last_ping_ts = cp_ts
+        progress.status = status
+        progress.last_ping_dt = last_ping
+        progress.last_start_dt = last_start
+        progress.last_start_rid = last_start_rid
+        progress.last_duration = last_duration
+        progress.down_since = down_since
+        progress.down_old_status = down_old
+        progress.last_n = prev_n
+        progress.anchored = anchored
+        progress.boundary_uncertain = boundary_uncertain
+        progress.completed = adopted
+        progress.stop_reason = stop_reason
+        progress.updated = frozen_now
+        progress.save()
+
+        if new_flips:
+            Flip.objects.bulk_create(new_flips)
+
+        result.processed = processed
+        result.completed = adopted
+        result.stop_reason = stop_reason
+        return result
 
 
 class PingDict(TypedDict):
@@ -1432,6 +1769,43 @@ class Flip(models.Model):
             return self.created - prev_flip.created
 
         return None
+
+
+class RebuildProgress(models.Model):
+    """High-water mark for Check.rebuild_state().
+
+    One row per Check that has been (or is being) rebuilt from its ping
+    sequence. It remembers how far the ping log has been confirmed and the
+    simulated state at that position, so rebuilds can resume after a gap
+    decision or an interruption, and converge over repeated runs.
+    """
+
+    owner = models.OneToOneField(Check, models.CASCADE, primary_key=True)
+    # Numeric Ping.id order is the authoritative event order.
+    last_ping_id = models.BigIntegerField(default=0)
+    # Timestamp of the last confirmed ping; lower bound of the rebuild window.
+    last_ping_ts = models.DateTimeField()
+    # Simulated status at last_ping_id
+    status = models.CharField(max_length=6, choices=STATUSES, default="new")
+    last_ping_dt = models.DateTimeField(null=True, blank=True)
+    last_start_dt = models.DateTimeField(null=True, blank=True)
+    last_start_rid = models.UUIDField(null=True, blank=True)
+    last_duration = models.DurationField(null=True, blank=True)
+    # Start time of the current open downtime episode (if status is "down")
+    down_since = models.DateTimeField(null=True, blank=True)
+    # Status before the current open downtime episode ("up" or "new")
+    down_old_status = models.CharField(max_length=6, blank=True, default="")
+    # n value of the last confirmed ping (for gap detection across passes)
+    last_n = models.IntegerField(null=True, blank=True)
+    # True once the status has been anchored to a concrete success/fail event
+    anchored = models.BooleanField(default=False)
+    # True when pings older than the first retained ping are missing
+    boundary_uncertain = models.BooleanField(default=False)
+    # True after the rebuild caught up and rewrote the Check's live fields
+    completed = models.BooleanField(default=False)
+    # Why the last pass stopped ("" when it made full progress)
+    stop_reason = models.CharField(max_length=100, blank=True, default="")
+    updated = models.DateTimeField(default=now)
 
 
 class TokenBucket(models.Model):
