@@ -39,6 +39,7 @@ from hc.accounts.models import Profile, Project
 from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
 from hc.api.forms import FlipsFiltersForm
 from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
+from hc.api.snapshots import badge_status, current_snapshot, try_record_current_snapshot
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
@@ -451,10 +452,16 @@ def create_check(request: ApiRequest) -> HttpResponse:
         check = Check(project=request.project)
         created = True
 
+    old_name = check.name
     try:
         _update(check, spec, request.v)
     except BadChannelException as e:
         return JsonResponse({"error": e.message}, status=400)
+
+    # New checks are handled by the post_save signal; here we only need to
+    # record renames of pre-existing checks.
+    if not created and check.name != old_name:
+        try_record_current_snapshot(request.project, source="check_renamed")
 
     return JsonResponse(check.to_dict(v=request.v), status=201 if created else 200)
 
@@ -507,12 +514,16 @@ def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
     except ValidationError as e:
         return JsonResponse({"error": format_first_error(e)}, status=400)
 
+    old_name = check.name
     try:
         _update(check, spec, request.v)
     except BadChannelException as e:
         return JsonResponse({"error": e.message}, status=400)
     except Check.NotUpdated:
         return HttpResponseNotFound()
+
+    if check.name != old_name:
+        try_record_current_snapshot(request.project, source="check_renamed")
 
     return JsonResponse(check.to_dict(v=request.v))
 
@@ -739,32 +750,38 @@ def badge(
     if not check_signature(badge_key, tag, signature):
         return HttpResponseNotFound()
 
-    q = Check.objects.filter(project__badge_key=badge_key)
     if tag == "*":
         label = settings.MASTER_BADGE_LABEL
+        # The project-wide badge reads the latest persisted snapshot, the same
+        # result the status page reports.
+        project = get_object_or_404(Project, badge_key=badge_key)
+        snapshot = current_snapshot(project)
+        status = badge_status(snapshot, with_late=with_late)
+        total, grace, down = snapshot.total, snapshot.grace, snapshot.down
     else:
+        q = Check.objects.filter(project__badge_key=badge_key)
         q = q.filter(tags__contains=tag)
         label = tag
 
-    status, total, grace, down = "up", 0, 0, 0
-    for check in q:
-        if tag != "*" and tag not in check.tags_list():
-            continue
+        status, total, grace, down = "up", 0, 0, 0
+        for check in q:
+            if tag not in check.tags_list():
+                continue
 
-        total += 1
-        check_status = check.get_status()
+            total += 1
+            check_status = check.get_status()
 
-        if check_status == "down":
-            down += 1
-            status = "down"
-            if fmt == "svg":
-                # For SVG badges, we can leave the loop as soon as we
-                # find the first "down"
-                break
-        elif check_status == "grace":
-            grace += 1
-            if status == "up" and with_late:
-                status = "late"
+            if check_status == "down":
+                down += 1
+                status = "down"
+                if fmt == "svg":
+                    # For SVG badges, we can leave the loop as soon as we
+                    # find the first "down"
+                    break
+            elif check_status == "grace":
+                grace += 1
+                if status == "up" and with_late:
+                    status = "late"
 
     if fmt == "shields":
         return _shields_response(label, status)

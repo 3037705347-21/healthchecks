@@ -406,6 +406,14 @@ class Check(models.Model):
             # Retry once
             q.delete()
 
+        project = Project.objects.filter(pk=self.project_id).first()
+        if project is not None:
+            # Record the new roster in the project's status snapshots. Imported
+            # here to avoid a circular import at module load time.
+            from hc.api.snapshots import try_record_current_snapshot
+
+            try_record_current_snapshot(project, source="check_removed")
+
     def assign_all_channels(self) -> None:
         channels = Channel.objects.filter(project=self.project)
         self.channel_set.set(channels)
@@ -1432,6 +1440,75 @@ class Flip(models.Model):
             return self.created - prev_flip.created
 
         return None
+
+
+SNAPSHOT_STATUSES = (("up", "Up"), ("down", "Down"), ("grace", "Grace"))
+SNAPSHOT_SOURCES = (
+    ("initial", "Initial"),
+    ("periodic", "Periodic"),
+    ("catch_up", "Catch up"),
+    ("check_added", "Check added"),
+    ("check_renamed", "Check renamed"),
+    ("check_removed", "Check removed"),
+    ("check_status", "Check status changed"),
+)
+
+
+class ProjectStatusSnapshot(models.Model):
+    """An append-only record of the project's overall status at a point in time.
+
+    Rows are derived from actual check state changes: a new row is appended when
+    a check is added, renamed, removed, or changes status. Existing rows are never
+    modified or deleted (this includes rows flagged as manually retained). The
+    public status page and the badge both read the project's latest row, so they
+    always report the same result.
+    """
+
+    project = models.ForeignKey(
+        Project, models.CASCADE, related_name="status_snapshots"
+    )
+    created = models.DateTimeField()
+    status = models.CharField(max_length=6, choices=SNAPSHOT_STATUSES)
+    total = models.IntegerField()
+    grace = models.IntegerField()
+    down = models.IntegerField()
+    # Immutable roster of the project's checks at the time of the snapshot.
+    # Stored as a list of {"code", "name", "status"} dictionaries, ordered by
+    # check id. Keeping the names here makes check additions, removals and
+    # renames observable even when the overall status itself does not change.
+    checks = models.JSONField(default=list)
+    source = models.CharField(
+        max_length=20, choices=SNAPSHOT_SOURCES, default="check_status"
+    )
+    # Manual snapshots (hand-retained history intervals) must never be replaced
+    # or deleted by the snapshot machinery.
+    manual = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["created"]
+        get_latest_by = "created"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "created"],
+                name="api_pstatussnapshot_project_created",
+            ),
+        ]
+
+
+class ProjectSnapshotCursor(models.Model):
+    """A per-project resume position for backfilling snapshots from flips.
+
+    last_flip_id points at the last Flip whose state change has already been
+    reflected in the project's snapshots. It is only advanced together with a
+    successfully written snapshot, so an interrupted or failed run resumes from
+    this position and only fills the missing gap, never writing duplicates.
+    """
+
+    project = models.OneToOneField(
+        Project, models.CASCADE, related_name="snapshot_cursor"
+    )
+    last_flip_id = models.BigIntegerField(null=True, blank=True)
+    updated = models.DateTimeField(default=now)
 
 
 class TokenBucket(models.Model):

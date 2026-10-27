@@ -51,6 +51,10 @@ from hc.api.models import (
     Ping,
     prepare_durations,
 )
+from hc.api.snapshots import (
+    current_snapshot,
+    try_record_current_snapshot,
+)
 from hc.front import forms
 from hc.front.templatetags.hc_extras import (
     down_title,
@@ -335,8 +339,26 @@ def status(request: HttpRequest, code: UUID) -> HttpResponse:
 
     tags_counts, num_down = _tags_counts(checks)
     tags = {tag: (status, tooltip) for tag, status, tooltip in tags_counts}
+
+    # The project-wide result is read from the persisted snapshot store --
+    # the exact same source the badge uses -- so the status page and the
+    # badge can never report different overall results.
+    snap = current_snapshot(project)
+    overall = {
+        "status": snap.status,
+        "total": snap.total,
+        "grace": snap.grace,
+        "down": snap.down,
+        "updated": snap.created.replace(microsecond=0).isoformat(),
+    }
+
     return JsonResponse(
-        {"details": details, "tags": tags, "title": num_down_title(num_down)}
+        {
+            "details": details,
+            "tags": tags,
+            "title": num_down_title(num_down),
+            "overall": overall,
+        }
     )
 
 
@@ -564,11 +586,19 @@ def update_name(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     if not form.is_valid():
         return HttpResponseBadRequest()
 
+    renamed = form.cleaned_data["name"] != check.name
+    project = check.project
+
     check.name = form.cleaned_data["name"]
     check.slug = form.cleaned_data["slug"]
     check.tags = form.cleaned_data["tags"]
     check.desc = form.cleaned_data["desc"]
     check.save(update_fields=("name", "slug", "tags", "desc"))
+
+    if renamed:
+        # A rename does not change any status, but it does change the roster
+        # recorded in the project's status snapshots.
+        try_record_current_snapshot(project, source="check_renamed")
 
     if "/details/" in request.headers.get("Referer", ""):
         return redirect("hc-details", code)
@@ -1064,9 +1094,15 @@ def transfer(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
             if target_project.num_checks_available() <= 0:
                 return HttpResponseBadRequest()
 
+        source_project = check.project
         check.project = target_project
         check.save(update_fields=("project",))
         check.assign_all_channels()
+
+        if source_project != target_project:
+            # The check left one project's roster and joined the other's:
+            try_record_current_snapshot(source_project, source="check_removed")
+            try_record_current_snapshot(target_project, source="check_added")
 
         messages.success(request, "Check transferred successfully!")
         return redirect("hc-details", code)

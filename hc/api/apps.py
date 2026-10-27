@@ -13,6 +13,10 @@ from django.http.request import split_domain_port, validate_host
 class ApiConfig(AppConfig):
     name = "hc.api"
 
+    def ready(self) -> None:
+        # Register signal handlers that keep project status snapshots current:
+        from hc.api import signals  # noqa: F401
+
 
 @register()  # W001, W002, W005, E002, E003
 def settings_check(
